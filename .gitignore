@@ -1,0 +1,4 @@
+web_app_sec.pem
+venv
+*.pyc
+*.sqlite3
