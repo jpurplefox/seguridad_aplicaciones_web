@@ -1,20 +1,16 @@
 AWSTemplateFormatVersion: 2010-09-09
 Description: >-
-  AWS CloudFormation Sample Template Rails_Single_Instance: Create a Ruby on
-  Rails stack using a single EC2 instance with a local MySQL database for
-  storage. This template demonstrates using the AWS CloudFormation bootstrap
-  scripts to install the packages and files necessary to deploy a Rails
-  application. This example creates a simple hello world application from the
-  template. **WARNING** This template creates an Amazon EC2 instance. You will
-  be billed for the AWS resources used if you create a stack from this template.
+  Django application template: Create a basic Django
+  application using a EC2 instance with nginx and gunicorn and a RDS database based
+  on postgres for storage.
 Parameters:
   KeyName:
     Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
     Type: 'AWS::EC2::KeyPair::KeyName'
     ConstraintDescription: must be the name of an existing EC2 KeyPair.
   DBName:
-    Default: MyDatabase
-    Description: MySQL database name
+    Default: myapp
+    Description: Postgres database name
     Type: String
     MinLength: '1'
     MaxLength: '64'
@@ -36,14 +32,28 @@ Parameters:
     MaxLength: '41'
     AllowedPattern: '[a-zA-Z0-9]*'
     ConstraintDescription: must contain only alphanumeric characters.
-  DBRootPassword:
-    NoEcho: 'true'
-    Description: Root password for MySQL
+  AdminUsername:
+    Description: Username for django admin
     Type: String
     MinLength: '1'
     MaxLength: '41'
     AllowedPattern: '[a-zA-Z0-9]*'
     ConstraintDescription: must contain only alphanumeric characters.
+  AdminPassword:
+    NoEcho: 'true'
+    Description: Password for django admin user
+    Type: String
+    MinLength: '1'
+    MaxLength: '41'
+    AllowedPattern: '[a-zA-Z0-9]*'
+    ConstraintDescription: must contain only alphanumeric characters.
+  AdminEmail:
+    Description: Email for django admin user
+    Type: String
+    MinLength: '1'
+    MaxLength: '41'
+    AllowedPattern: '^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
+    ConstraintDescription: must be a valid email.
   InstanceType:
     Description: WebServer EC2 instance type
     Type: String
@@ -386,6 +396,42 @@ Mappings:
       HVM64: ami-0f7937761741dc640
       HVMG2: NOT_SUPPORTED
 Resources:
+  WebServerSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable HTTP and SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '8000'
+          ToPort: '8000'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: !Ref SSHLocation
+  DatabaseSecurityGroup:
+    Type: 'AWS::RDS::DBSecurityGroup'
+    Properties:
+      GroupDescription: Enable HTTP and SSH access
+      DBSecurityGroupIngress:
+        CIDRIP: "0.0.0.0/0"
+  DBInstance:
+    DeletionPolicy: Snapshot # default
+    UpdateReplacePolicy: Snapshot
+    Type: 'AWS::RDS::DBInstance'
+    Properties:
+      AllocatedStorage: 20
+      DBInstanceClass: db.t2.micro
+      DBName: !Ref DBName
+      Engine: postgres
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      DBSecurityGroups:
+      - !Ref DatabaseSecurityGroup
   WebServer:
     Type: 'AWS::EC2::Instance'
     Metadata:
@@ -449,18 +495,58 @@ Resources:
             yum:
               python36: []
               git: []
+              nginx: []
+              postgresql92-devel: []
+              gcc: []
+              python36-devel: []
         install_application:
           commands:
             01_get_application:
               command: git clone https://github.com/jpurplefox/seguridad_aplicaciones_web.git /srv/app
             02_install_dependencies:
               command: python36 -m pip install -r /srv/app/requirements.txt
-            03_migrate_database:
+            03_install_app:
+              command: python36 -m pip install /srv/app/my_app
+            04_migrate_database:
               command: python36 /srv/app/my_app/manage.py migrate
-            04_init_gunicorn:
+              env:
+                DB_HOST: !GetAtt DBInstance.Endpoint.Address
+                DB_USER: !Ref DBUser
+                DB_PASSWORD: !Ref DBPassword
+                DB_NAME: !Ref DBName
+            05_create_superuser:
+              command: python36 /srv/app/my_app/manage.py createsuperuser --no-input
+              env:
+                DB_HOST: !GetAtt DBInstance.Endpoint.Address
+                DB_USER: !Ref DBUser
+                DB_PASSWORD: !Ref DBPassword
+                DB_NAME: !Ref DBName
+                DJANGO_SUPERUSER_USERNAME: !Ref AdminUsername
+                DJANGO_SUPERUSER_PASSWORD: !Ref AdminPassword
+                DJANGO_SUPERUSER_EMAIL: !Ref AdminEmail
+            06_collectstatic:
+              command: python36 /srv/app/my_app/manage.py collectstatic --no-input
+              env:
+                DB_HOST: !GetAtt DBInstance.Endpoint.Address
+                DB_USER: !Ref DBUser
+                DB_PASSWORD: !Ref DBPassword
+                DB_NAME: !Ref DBName
+            07_init_gunicorn:
               command: /usr/local/bin/gunicorn --daemon my_app.wsgi -b 0.0.0.0:8000
-            # 04_cleanup:
-              # command: rm /tmp/install_application
+              env:
+                DB_HOST: !GetAtt DBInstance.Endpoint.Address
+                DB_USER: !Ref DBUser
+                DB_PASSWORD: !Ref DBPassword
+                DB_NAME: !Ref DBName
+            08_config_nginx:
+              command: mv -f /srv/app/nginx.conf /etc/nginx/nginx.conf
+          services:
+            sysvinit:
+              nginx:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/nginx/nginx.conf
     Properties:
       ImageId: !FindInMap 
         - AWSRegionArch2AMI
@@ -500,19 +586,6 @@ Resources:
     CreationPolicy:
       ResourceSignal:
         Timeout: PT30M
-  WebServerSecurityGroup:
-    Type: 'AWS::EC2::SecurityGroup'
-    Properties:
-      GroupDescription: Enable HTTP and SSH access
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: '80'
-          ToPort: '80'
-          CidrIp: 0.0.0.0/0
-        - IpProtocol: tcp
-          FromPort: '22'
-          ToPort: '22'
-          CidrIp: !Ref SSHLocation
 Outputs:
   WebsiteURL:
     Value: !Join 
@@ -521,5 +594,5 @@ Outputs:
         - !GetAtt 
           - WebServer
           - PublicDnsName
-        - /notes
-    Description: URL for newly created Rails application
+        - /admin/
+    Description: URL for newly created Django application
